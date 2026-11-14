@@ -41,6 +41,8 @@
 #   · SNVN (Retro Studios, Donkey Kong Country: Tropical Freeze, Metroid Prime Remastered): zlib program records in the SNVN chunks of MaterialArchive.arc, of the MTRL resources in its
 #       .pak archives and of the startup material archive LZSS-compressed in main, see rfrm_shaders and retro_main_forms
 #   · BERG (Snowdrop, Mario + Rabbids Sparks of Hope): shader objects in the individually zstd-compressed records of its SDF data slices, see snowdrop_shaders
+#   · RDHS v3 and FZLC (REDengine, The Witcher 3): a GLSLC output in every zstd record of each content/*/shadernx.cache, and in the FZLC chunks of
+#       staticshadernx.cache, see rdhs_shaders and fzlc_shaders
 #   · bnd2 (Criterion's Bundle 2, Need for Speed: Hot Pursuit Remastered): whole GLSLC outputs in the zlib resources of SHADERS.BNDL, see bnd2_resources and bnd2_shaders
 #   · Heaps (Dead Cells): whole GLSLC outputs in base64 after the GLSL of the engine's shader cache (shaders.cache.nx), inside its PAK archive, see heaps_pak_files and heaps_shaders
 #   · Frostbite (EA SPORTS FC 27): the CompiledBytecode resources of the bundles its superbundle tables (.toc) list, in its cas files (Oodle Leviathan, decoded by the game's own decoder in the
@@ -2264,6 +2266,43 @@ def sumo_shaders(d, label):
         out.append(sumo_program(d, h, size, co, ko, cn, kn, f'{label}#NVNSH@{h:#x}', STAGES[stage]))
     return out
 
+def fzlc_unchunk(d, label):
+    """REDengine's chunked zstd container ('FZLC', The Witcher 3's content/content0/staticshadernx.cache): u32 chunk count, then per chunk
+    {u32 offset, u32 stored length, u32 length}, each a zstd frame → the chunks joined."""
+    zstd = zstd_mod(); out = []
+    n = field(d, '<I', 4, label)[0]
+    if 8 + 12 * n > len(d): red(f'{label}: FZLC chunk table of {n} entries lies outside the file')
+    for i in range(n):
+        off, cs, us = struct.unpack_from('<3I', d, 8 + 12 * i)
+        if off + cs > len(d) or d[off:off + 4] != ZSTD_MAGIC: red(f'{label}: FZLC chunk {i} @{off:#x} is not a zstd frame')
+        b = zstd.decompress(d[off:off + cs])
+        if len(b) != us: red(f'{label}: FZLC chunk {i} is {len(b):#x} bytes, its entry says {us:#x}')
+        out.append(b)
+    return b''.join(out)
+
+def fzlc_shaders(d, label):
+    """The GLSLC outputs an FZLC container's payload holds (The Witcher 3's staticshadernx.cache: records of {u64 hash, u64 hash, u32 length,
+    a GLSLC output} laid end to end, the length the output's own, so the joined bytes are scanned for the outputs)."""
+    return glslc_shaders(fzlc_unchunk(d, label), f'{label}#FZLC', need=False)
+
+def rdhs_shaders(d, label):
+    """REDengine's shader cache, version 3 (The Witcher 3's content/*/shadernx.cache, every content level's and DLC's own): a run of
+    {u64 hash, u8 1, u32 raw length, u32 stored length, one zstd frame holding a GLSLC output}, then the name index and a trailer
+    {u32 record count, u32, u64, u64 index offset, u64 index length, u64 index offset, 'RDHS', u32 3}. Read by the trailer's magic, the
+    index offset ending the run, as the generic prefilter sees nothing in the compressed records."""
+    if len(d) < 0x30 or d[-8:-4] != b'RDHS': return []
+    n, ioff = struct.unpack_from('<I', d, len(d) - 48)[0], struct.unpack_from('<Q', d, len(d) - 32)[0]
+    out = []; pos = 0; recs = 0; zstd = zstd_mod()
+    while pos < ioff:
+        h, t, us, cs = struct.unpack_from('<QBII', d, pos)
+        if t != 1 or pos + 17 + cs > ioff: red(f'{label}: record @{pos:#x} breaks the run')
+        raw = zstd.decompress(d[pos + 17:pos + 17 + cs])
+        if len(raw) != us: red(f'{label}: record @{pos:#x} is {len(raw):#x} bytes, its header says {us:#x}')
+        out += glslc_shaders(raw, f'{label}#RDHS@{pos:#x}'); recs += 1
+        pos += 17 + cs
+    if recs != n: red(f'{label}: the trailer names {n} records, the run holds {recs}')
+    return out
+
 def phyre_shaders(d, label):
     """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2)."""
     out = []
@@ -3436,6 +3475,9 @@ def scan_file_in(args):
     if head[:4] == b'BERG':   # Snowdrop's SDF data slices: shader objects in individual compressed records
         with open(path, 'rb') as f: found += snowdrop_shaders(f.read(), '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == b'FZLC':   # REDengine's chunked zstd container (The Witcher 3's staticshadernx.cache): a GLSLC store once unchunked (fzlc_shaders)
+        with open(path, 'rb') as f: found += fzlc_shaders(f.read(), '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == MTARC:   # an MT Framework archive (mtarc_members): its shader package
         mtarc_shaders(open(path, 'rb').read(), '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -3485,6 +3527,7 @@ def scan_file_in(args):
         try: pairs = unity_shaders(d, '/' + rel, found, trees if not TREES else dict(TREES))
         except unityfs.NoTree: return rel, {}, set(), 'defer'
         return rel, uniq_keys(found), var_pairs(found) | {(a, b, 'prog') for a, b in pairs}, trees
+    elif d[-8:-4] == b'RDHS': found += rdhs_shaders(d, '/' + rel)   # REDengine's shader cache (The Witcher 3's shadernx.cache): no head magic, the GLSLC outputs in its zstd records (rdhs_shaders)
     elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and d[:4] != b'NDSR' and d[:4] != b'NARC' and d[:4] != b'NDVE' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != PACX4 and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members, a NARC packed ones (cra.undo)
     else:
         scan_blob(d, '/' + rel, found)
